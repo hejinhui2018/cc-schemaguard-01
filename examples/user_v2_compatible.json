@@ -1,0 +1,27 @@
+{
+  "version": "1.1.0",
+  "defs": {
+    "Address": {
+      "type": "object",
+      "fields": [
+        {"name": "city", "type": "string"},
+        {"name": "zip", "type": "string", "optional": true},
+        {"name": "country", "type": "string", "optional": true, "default": "CN"}
+      ]
+    }
+  },
+  "root": {
+    "type": "object",
+    "fields": [
+      {"name": "id", "type": "integer"},
+      {"name": "name", "type": "string"},
+      {
+        "name": "status",
+        "type": {"type": "string", "enum": ["ACTIVE", "DISABLED"], "default": "ACTIVE"}
+      },
+      {"name": "address", "type": "Address", "optional": true},
+      {"name": "tags", "type": {"type": "array", "items": "string"}, "optional": true},
+      {"name": "email", "type": "string", "optional": true, "default": ""}
+    ]
+  }
+}
