@@ -284,9 +284,6 @@ def _assess_consumer(
         # $defs 下的孤岛定义变更不经过线上数据结构（与全局评估口径一致）
         if change.path.startswith("$defs."):
             continue
-        # additionalProperties 只是对象元信息，不进入下游投影
-        if change.kind is ChangeKind.ADDITIONAL_PROPERTIES_CHANGED:
-            continue
         segs = parse_change_path(change.path)
 
         if path_affects(segs, points):
@@ -305,11 +302,6 @@ def _assess_consumer(
         if verdict is None:
             continue
         severity, rule_id, message = verdict
-        # 下游评估只收集阻断项；警告留给上游自身的 check
-        if severity is Severity.WARNING and not (
-            change.kind is ChangeKind.FIELD_ADDED and profile.strict
-        ):
-            continue
         if change.kind is ChangeKind.FIELD_ADDED and profile.strict:
             # F001 的「若严格拒绝未知字段」对该下游成立：提示升级为阻断
             severity = Severity.ERROR
