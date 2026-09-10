@@ -6,15 +6,17 @@
 
        python -m datacontract check old.json new.json
        python -m datacontract check old.json new.json --format json --fail-on error
+       python -m datacontract evaluate old.json new.json --consumer payment.json
+       python -m datacontract evaluate old.json new.json --consumers consumers/ --fail-on any
 
    退出码：
        0  放行（按 --fail-on 阈值没有命中）
-       1  阻断（存在不兼容；--fail-on warning 时警告也阻断）
-       2  用法错误或契约本身非法
+       1  阻断（check：存在不兼容；evaluate：命中治理放行口径）
+       2  用法错误或契约/下游画像本身非法
 
 2. 可编程::
 
-       from datacontract import evaluate_paths
+       from datacontract import evaluate_paths, evaluate_governance
        result = evaluate_paths("old.json", "new.json")
        if not result["fully_compatible"]:
            ...  # 阻断流水线
@@ -35,11 +37,19 @@ from .compatibility import (
     Severity,
     check_compatibility,
 )
+from .consumer import ConsumerError, parse_consumer_file
 from .diff import diff_contracts
+from .governance import (
+    FAIL_ANY,
+    FAIL_CRITICAL,
+    GateVerdict,
+    GovernanceEvaluation,
+    evaluate_governance,
+)
 from .migration import MigrationPlan, plan_migration
 from .parser import Contract, ContractError, parse_file
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 EXIT_OK = 0
 EXIT_INCOMPATIBLE = 1
@@ -91,6 +101,19 @@ def evaluate_paths(old_path: str | Path, new_path: str | Path, **kwargs: Any) ->
     old = parse_file(old_path)
     new = parse_file(new_path)
     return evaluate(old, new, **kwargs)
+
+
+def evaluate_governance_paths(
+    old_path: str | Path,
+    new_path: str | Path,
+    consumer_paths: Sequence[str | Path] = (),
+    **kwargs: Any,
+) -> GovernanceEvaluation:
+    """文件路径版本的 :func:`evaluate_governance`（多下游治理评估）。"""
+    old = parse_file(old_path)
+    new = parse_file(new_path)
+    consumers = [parse_consumer_file(p) for p in consumer_paths]
+    return evaluate_governance(old, new, consumers, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -145,6 +168,71 @@ def _render_human(ev: Evaluation) -> str:
     return "\n".join(lines)
 
 
+def _render_governance_human(ev: GovernanceEvaluation) -> str:
+    r = ev.report
+    lines: list[str] = []
+    lines.append(
+        f"数据契约发版评估：{r.old_version or '(无版本号)'} → {r.new_version or '(无版本号)'}"
+    )
+
+    # 上游自身兼容性（上下文）
+    p = r.producer
+    fwd = "✓" if p.forward_compatible else "✗"
+    bwd = "✓" if p.backward_compatible else "✗"
+    lines.append(
+        f"上游自身兼容性：前向 {fwd}（{len(p.errors(Direction.FORWARD))} 个阻断项）"
+        f" / 后向 {bwd}（{len(p.errors(Direction.BACKWARD))} 个阻断项）"
+    )
+
+    # 按下游的结论
+    if not r.consumers:
+        lines.append("下游评估：未提供下游画像（--consumer/--consumers），仅评估上游自身兼容性")
+    else:
+        critical_count = sum(1 for a in r.consumers if a.critical)
+        lines.append(f"下游评估（共 {len(r.consumers)} 个，其中关键下游 {critical_count} 个）：")
+    for a in r.consumers:
+        tag = "关键" if a.critical else "非关键"
+        errors, warns = a.errors, a.warnings
+        if a.compatible:
+            lines.append(f"  ✓ {a.name}（{tag}）：通过（{len(warns)} 个警告）")
+        else:
+            lines.append(f"  ✗ {a.name}（{tag}）：{len(errors)} 个阻断项, {len(warns)} 个警告")
+        for f in a.findings:
+            mark = "✗" if f.severity is Severity.ERROR else "!"
+            lines.append(f"      {mark} {f.path}  [{f.rule_id}/{f.severity.value}]")
+            lines.append(f"          {f.message}")
+
+    # 迁移步骤（按执行者落到上游/具体下游）
+    if r.plan.steps:
+        lines.append("")
+        lines.append("迁移步骤建议（按执行顺序；producer=上游，consumer:<名>=具体下游）：")
+        for s in r.plan.steps:
+            rb = "可安全回滚" if s.rollback_safe else "不可安全回滚"
+            lines.append(f"  {s.order:>2}. [{s.actor}/{s.severity}] {s.action}")
+            lines.append(f"       路径: {', '.join(s.paths)}（规则 {s.rule_id}，{rb}）")
+            lines.append(f"       {s.detail}")
+            lines.append(f"       回滚: {s.rollback}")
+
+    # 治理放行口径
+    lines.append("")
+    if r.verdict is GateVerdict.PASS:
+        verdict_label = "放行 ✅"
+    elif r.verdict is GateVerdict.BLOCKED:
+        verdict_label = "阻断 ❌"
+    elif r.consumers:
+        verdict_label = "放行（仅非关键下游受影响）⚠️"
+    else:
+        verdict_label = "放行（未提供下游画像，影响面未知）⚠️"
+    lines.append(f"治理结论: {verdict_label}")
+    for reason in r.blocking_reasons:
+        lines.append(f"  ✗ {reason}")
+    for reason in r.warning_reasons:
+        lines.append(f"  ! {reason}")
+    if not ev.passed and r.verdict is not GateVerdict.BLOCKED:
+        lines.append(f"  （--fail-on {ev.fail_on} 阈值下判定为不通过）")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # argparse 入口
 # ---------------------------------------------------------------------------
@@ -173,6 +261,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=FAIL_ERROR,
         help="阻断阈值：error=存在不兼容即阻断（默认）；warning=有警告也阻断；never=总放行",
     )
+
+    evaluate_cmd = sub.add_parser(
+        "evaluate",
+        help="多下游发版评估：把上游变更投影到每个下游实际消费的数据结构上",
+    )
+    evaluate_cmd.add_argument("old", help="旧版本契约 JSON 文件（下游当前依赖的版本）")
+    evaluate_cmd.add_argument("new", help="新版本契约 JSON 文件（上游即将发布的版本）")
+    evaluate_cmd.add_argument(
+        "--consumer",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="下游消费画像 JSON 文件，可重复指定多个",
+    )
+    evaluate_cmd.add_argument(
+        "--consumers",
+        action="append",
+        default=[],
+        metavar="DIR",
+        help="下游画像目录（加载其中全部 *.json），可重复指定多个",
+    )
+    evaluate_cmd.add_argument(
+        "--format",
+        choices=("human", "json"),
+        default="human",
+        help="输出格式，默认 human",
+    )
+    evaluate_cmd.add_argument(
+        "--fail-on",
+        choices=(FAIL_CRITICAL, FAIL_ANY, FAIL_NEVER),
+        default=FAIL_CRITICAL,
+        help=(
+            "放行口径：critical=关键下游受损才阻断（默认）；"
+            "any=任何下游受损都阻断；never=只出报告不阻断"
+        ),
+    )
     return parser
 
 
@@ -194,6 +318,29 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(json.dumps(ev.to_dict(), ensure_ascii=False, indent=2))
         else:
             print(_render_human(ev))
+        return ev.exit_code()
+
+    if args.command == "evaluate":
+        consumer_files: list[str] = list(args.consumer)
+        for directory in args.consumers:
+            consumer_files.extend(
+                str(p) for p in sorted(Path(directory).glob("*.json"))
+            )
+        try:
+            ev = evaluate_governance_paths(
+                args.old, args.new, consumer_files, fail_on=args.fail_on
+            )
+        except (ContractError, ConsumerError) as exc:
+            print(f"输入非法: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+        except (OSError, json.JSONDecodeError) as exc:
+            print(f"无法读取输入文件: {exc}", file=sys.stderr)
+            return EXIT_USAGE
+
+        if args.format == "json":
+            print(json.dumps(ev.to_dict(), ensure_ascii=False, indent=2))
+        else:
+            print(_render_governance_human(ev))
         return ev.exit_code()
 
     parser.error(f"未知命令: {args.command}")  # pragma: no cover

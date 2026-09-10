@@ -117,6 +117,14 @@ class CompatibilityReport:
         }
 
 
+def judge_change(change: Change, direction: Direction) -> _Verdict:
+    """对单条变更在指定方向上套用规则矩阵（多下游评估的公开入口）。
+
+    返回 ``(severity, rule_id, message)`` 或 ``None``（该方向上良性）。
+    """
+    return _RULES.dispatch(change, direction)
+
+
 def check_compatibility(
     old: Contract,
     new: Contract,

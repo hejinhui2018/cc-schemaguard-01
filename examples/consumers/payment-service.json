@@ -1,0 +1,14 @@
+{
+  "name": "payment-service",
+  "critical": true,
+  "contract": {
+    "root": {
+      "type": "object",
+      "fields": [
+        {"name": "id", "type": "integer"},
+        {"name": "name", "type": "string"},
+        {"name": "status", "type": {"type": "string", "enum": ["ACTIVE", "DISABLED"]}}
+      ]
+    }
+  }
+}

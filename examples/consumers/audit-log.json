@@ -1,0 +1,23 @@
+{
+  "name": "audit-log",
+  "critical": false,
+  "strict": true,
+  "contract": {
+    "root": {
+      "type": "object",
+      "fields": [
+        {"name": "id", "type": "integer"},
+        {"name": "name", "type": "string"},
+        {"name": "status", "type": "string"},
+        {"name": "address", "type": {
+          "type": "object",
+          "fields": [
+            {"name": "city", "type": "string"},
+            {"name": "zip", "type": "string", "optional": true}
+          ]
+        }, "optional": true},
+        {"name": "tags", "type": {"type": "array", "items": "string"}, "optional": true}
+      ]
+    }
+  }
+}

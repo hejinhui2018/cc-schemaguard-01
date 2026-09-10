@@ -35,6 +35,20 @@ CONSUMER = "consumer"
 BOTH = "both"
 
 
+def consumer_actor(consumer: str | None) -> str:
+    """CONSUMER 步骤的执行者：指定下游时落到 ``consumer:<名字>``。"""
+    return f"consumer:{consumer}" if consumer else CONSUMER
+
+
+def _subject(consumer: str | None, generic: str) -> str:
+    """CONSUMER 步骤主语：指定下游时落到具体下游名，否则保持泛称。
+
+    指定下游时返回值带尾随空格（``下游 <名字> ``），便于模板直接拼接动词；
+    泛称时不带，保证既有文案逐字不变。
+    """
+    return f"下游 {consumer} " if consumer else generic
+
+
 @dataclass(frozen=True)
 class MigrationStep:
     order: int
@@ -128,6 +142,20 @@ def plan_migration(
 # ---------------------------------------------------------------------------
 
 
+def steps_for_error(finding: Finding, *, consumer: str | None = None) -> list[MigrationStep]:
+    """单条 ERROR finding 的迁移步骤。
+
+    ``consumer`` 指定具体下游名时，消费侧步骤的执行者与主语都落到该下游
+    （多下游治理评估使用）；为 ``None`` 时保持「全体消费方」的泛称文案。
+    """
+    return _plan_for_error(finding, consumer=consumer)
+
+
+def steps_for_warning(finding: Finding, *, consumer: str | None = None) -> list[MigrationStep]:
+    """单条 WARNING finding 的建议步骤（不阻断），``consumer`` 语义同上。"""
+    return _plan_for_warning(finding, consumer=consumer)
+
+
 def _step(
     phase: int,
     actor: str,
@@ -153,9 +181,29 @@ def _step(
     )
 
 
-def _plan_for_error(finding: Finding) -> list[MigrationStep]:
+def _plan_for_error(finding: Finding, consumer: str | None = None) -> list[MigrationStep]:
     p = (finding.path,)
     rid = finding.rule_id
+    ca = consumer_actor(consumer)
+
+    if rid == "F001":  # 新增字段打挂严格消费者（仅多下游评估中 strict 下游会升级为 ERROR）
+        return [
+            _step(
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '消费者')}放宽解析以容忍新字段 {finding.path}",
+                "严格模式（拒绝未知字段）会被任何字段新增击穿；改为忽略未知字段，"
+                "或为该字段在消费侧显式建模。",
+                rid, p, True,
+                "解析策略调整可独立回滚。",
+            ),
+            _step(
+                PHASE_PRODUCER_EXPAND, PRODUCER,
+                f"消费方就位前暂缓全量下发 {finding.path}",
+                "若下游短期无法放宽解析，上游暂缓该字段上线或先灰度，避免打挂严格消费者。",
+                rid, p, True,
+                "暂缓/灰度字段可随时恢复，尚未产生依赖。",
+            ),
+        ]
 
     if rid == "B001":  # 新增必填字段（无默认值）
         return [
@@ -167,8 +215,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
                 "回滚安全：停发该字段即恢复原状，无消费方依赖它。",
             ),
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"所有消费方升级为读取 {finding.path}",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '所有消费方')}升级为读取 {finding.path}",
                 "下游升级解析逻辑，字段缺失时按默认值兜底；灰度确认全部消费方就位。",
                 rid, p, True,
                 "回滚安全：消费方回滚后只是不再读取新字段。",
@@ -199,8 +247,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
                 "回滚安全：恢复必填标记即可，字段数据从未中断。",
             ),
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"下游移除对 {finding.path} 的强依赖",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '下游')}移除对 {finding.path} 的强依赖",
                 "各消费方改为字段缺失时走兜底逻辑，确认无人再按必填访问。",
                 rid, p, True,
                 "回滚安全：消费方回滚后字段仍在下发，不影响读取。",
@@ -224,8 +272,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
                 "回滚安全：多下发的字段对老消费者无影响。",
             ),
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"下游确认对 {finding.path} 的读取容忍历史缺失",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '下游')}确认对 {finding.path} 的读取容忍历史缺失",
                 "新消费者上线时仍需对留存窗口内可能缺失该字段的历史数据做兜底。",
                 rid, p, True,
                 "回滚安全：兜底逻辑保留只会更健壮。",
@@ -249,8 +297,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
     if rid in ("F010", "F012", "F014"):  # 枚举放宽：新增取值/替换/解除约束（伤老消费者）
         return [
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"消费者先升级对 {finding.path} 新取值的识别",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '消费者')}先升级对 {finding.path} 新取值的识别",
                 "所有消费方发布能识别新取值（或对未知枚举值有显式兜底而非静默默认）的版本。",
                 rid, p, True,
                 "回滚安全：提前具备识别能力不会影响只含旧值的数据。",
@@ -267,8 +315,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
     if rid in ("B011", "B012", "B013"):  # 枚举收窄：移除取值/替换/新增约束（伤新消费者读老数据）
         return [
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"新消费者保留对 {finding.path} 历史取值的兼容映射",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '新消费者')}保留对 {finding.path} 历史取值的兼容映射",
                 "在新消费者中对将被移除的取值做显式映射或容错，保证留存窗口内可读。",
                 rid, p, True,
                 "回滚安全：兼容映射只增不减。",
@@ -306,8 +354,8 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
                 "回滚安全：新字段是纯增量，停写即恢复。",
             ),
             _step(
-                PHASE_CONSUMER_UPGRADE, CONSUMER,
-                f"消费者迁移到读取 {finding.path} 的新字段",
+                PHASE_CONSUMER_UPGRADE, ca,
+                f"{_subject(consumer, '消费者')}迁移到读取 {finding.path} 的新字段",
                 "下游优先读新字段、缺失时回退老字段；逐方灰度切换。",
                 rid, p, True,
                 "回滚安全：回退逻辑仍指向老字段。",
@@ -352,15 +400,16 @@ def _plan_for_error(finding: Finding) -> list[MigrationStep]:
 # ---------------------------------------------------------------------------
 
 
-def _plan_for_warning(finding: Finding) -> list[MigrationStep]:
+def _plan_for_warning(finding: Finding, consumer: str | None = None) -> list[MigrationStep]:
     p = (finding.path,)
     rid = finding.rule_id
+    ca = consumer_actor(consumer)
 
     if rid in ("F001", "B002"):
         return [
             _step(
-                PHASE_ADVISORY, CONSUMER,
-                f"确认消费者对未知字段采取宽容解析：{finding.path}",
+                PHASE_ADVISORY, ca,
+                f"确认{_subject(consumer, '消费者')}对未知字段采取宽容解析：{finding.path}",
                 "建议统一「忽略未知字段」的解析策略，避免严格模式在字段增删时被击穿。",
                 rid, p, True,
                 "解析策略调整可独立回滚。",
@@ -382,10 +431,15 @@ def _plan_for_warning(finding: Finding) -> list[MigrationStep]:
         ]
 
     if rid in ("F040", "B040"):
+        action = (
+            f"确认下游 {consumer} 的额外属性策略与解析行为一致：{finding.path}"
+            if consumer
+            else f"确认额外属性策略与消费者解析行为一致：{finding.path}"
+        )
         return [
             _step(
-                PHASE_ADVISORY, CONSUMER,
-                f"确认额外属性策略与消费者解析行为一致：{finding.path}",
+                PHASE_ADVISORY, ca,
+                action,
                 finding.message,
                 rid, p, True,
                 "解析策略调整可独立回滚。",
